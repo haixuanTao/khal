@@ -93,6 +93,22 @@ impl KhalBuilder {
 
         self.setup_change_detection();
 
+        // cuda-oxide path: when a prebuilt cubin is supplied out-of-band (the
+        // shader crate was compiled to a cubin via the cuda-oxide PTX backend),
+        // embed it directly as `shaders.ptx` and skip the cargo-gpu / cargo-cuda
+        // shader builds — those need their own toolchains, which the cuda-oxide
+        // flow deliberately bypasses. The host's `include_dir!("$OUT_DIR/
+        // shaders-spirv")` then picks the cubin up unchanged.
+        println!("cargo:rerun-if-env-changed=CUDA_OXIDE_SHADERS_PTX");
+        if let Some(cubin) = std::env::var_os("CUDA_OXIDE_SHADERS_PTX") {
+            std::fs::create_dir_all(output_dir)
+                .expect("failed to create shader output dir for the cuda-oxide cubin");
+            std::fs::copy(&cubin, output_dir.join("shaders.ptx")).unwrap_or_else(|e| {
+                panic!("failed to copy CUDA_OXIDE_SHADERS_PTX ({cubin:?}) into {output_dir:?}: {e}")
+            });
+            return;
+        }
+
         if self.build_spirv {
             self.build_spirv(output_dir);
         }
