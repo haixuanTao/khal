@@ -121,6 +121,7 @@ pub struct CudaModule {
 #[derive(Clone)]
 pub struct CudaFunction {
     pub(crate) func: driver::CudaFunction,
+    pub(crate) name: String,
 }
 
 // ── Encoder / Pass ─────────────────────────────────────────────────────
@@ -271,9 +272,16 @@ impl Backend for Cuda {
             }
         }
 
-        // Expect PTX text bytes.
-        let ptx_str = std::str::from_utf8(bytes).map_err(|_| CudaBackendError::InvalidPtx)?;
-        let ptx = cudarc::nvrtc::Ptx::from_src(ptx_str.to_string());
+        // Accept either PTX text OR a pre-linked CUBIN (ELF magic). Libdevice
+        // kernels (exp/fma/...) must arrive as a cubin: their PTX carries
+        // unresolved __nv_* externs the driver JIT can't resolve, so cuda-oxide
+        // links libdevice (libNVVM + nvJitLink) into a self-contained cubin.
+        let ptx = if bytes.starts_with(&[0x7f, b'E', b'L', b'F']) {
+            cudarc::nvrtc::Ptx::from_binary(bytes.to_vec())
+        } else {
+            let ptx_str = std::str::from_utf8(bytes).map_err(|_| CudaBackendError::InvalidPtx)?;
+            cudarc::nvrtc::Ptx::from_src(ptx_str.to_string())
+        };
         let module = self.ctx.load_module(ptx)?;
 
         // Cache the loaded module.
@@ -291,8 +299,14 @@ impl Backend for Cuda {
         entry_point: &str,
         _push_constant_size: u32,
     ) -> Result<Self::Function, Self::Error> {
-        let func = module.inner.load_function(entry_point)?;
-        Ok(CudaFunction { func })
+        let func = match module.inner.load_function(entry_point) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[khal-cuda load_function FAIL] {} -> {:?}", entry_point, e);
+                return Err(e.into());
+            }
+        };
+        Ok(CudaFunction { func, name: entry_point.to_string() })
     }
 
     fn load_function_with_layouts(
@@ -580,8 +594,24 @@ impl<'a> Dispatch<'a, Cuda> for CudaDispatch<'a> {
             shared_mem_bytes: 0,
         };
 
+        let trace = std::env::var_os("KHAL_CUDA_TRACE").is_some();
+        if trace {
+            eprintln!(
+                "[khal-cuda launch] {} nargs={} grid={:?} block={:?}",
+                self.function.name, param_values.len(), grid_dim, block_dim
+            );
+        }
         unsafe {
             builder.launch(cfg)?;
+        }
+        if trace {
+            match self.stream.synchronize() {
+                Ok(()) => eprintln!("[khal-cuda   ok  ] {}", self.function.name),
+                Err(e) => {
+                    eprintln!("[khal-cuda  FAIL ] {} -> {:?}", self.function.name, e);
+                    return Err(e.into());
+                }
+            }
         }
 
         Ok(())
