@@ -27,10 +27,16 @@ mod cuda_oxide_float {
         fn max(self, other: Self) -> Self;
         fn min(self, other: Self) -> Self;
         fn atan(self) -> Self;
+        fn sin(self) -> Self;
+        fn cos(self) -> Self;
+        fn asin(self) -> Self;
+        fn acos(self) -> Self;
+        fn atan2(self, other: Self) -> Self;
+        fn signum(self) -> Self;
     }
 
     macro_rules! float_impl {
-        ($ty:ty, $exp:ident, $ln:ident, $sqrt:ident, $pow:ident, $floor:ident, $ceil:ident, $nvatan:ident) => {
+        ($ty:ty, $exp:ident, $ln:ident, $sqrt:ident, $pow:ident, $floor:ident, $ceil:ident, $nvatan:ident, $sin:ident, $cos:ident, $nvasin:ident, $nvacos:ident, $nvatan2:ident) => {
             impl Float for $ty {
                 #[inline(always)]
                 fn exp(self) -> $ty { unsafe { core::intrinsics::$exp(self) } }
@@ -56,9 +62,32 @@ mod cuda_oxide_float {
                     unsafe extern "C" { fn $nvatan(x: $ty) -> $ty; }
                     unsafe { $nvatan(self) }
                 }
+                #[inline(always)]
+                fn sin(self) -> $ty { unsafe { core::intrinsics::$sin(self) } }
+                #[inline(always)]
+                fn cos(self) -> $ty { unsafe { core::intrinsics::$cos(self) } }
+                #[inline(always)]
+                fn asin(self) -> $ty {
+                    unsafe extern "C" { fn $nvasin(x: $ty) -> $ty; }
+                    unsafe { $nvasin(self) }
+                }
+                #[inline(always)]
+                fn acos(self) -> $ty {
+                    unsafe extern "C" { fn $nvacos(x: $ty) -> $ty; }
+                    unsafe { $nvacos(self) }
+                }
+                #[inline(always)]
+                fn atan2(self, other: $ty) -> $ty {
+                    unsafe extern "C" { fn $nvatan2(y: $ty, x: $ty) -> $ty; }
+                    unsafe { $nvatan2(self, other) }
+                }
+                #[inline(always)]
+                fn signum(self) -> $ty {
+                    if self > 0.0 { 1.0 } else if self < 0.0 { -1.0 } else { 0.0 }
+                }
             }
         };
     }
-    float_impl!(f32, expf32, logf32, sqrtf32, powf32, floorf32, ceilf32, __nv_atanf);
-    float_impl!(f64, expf64, logf64, sqrtf64, powf64, floorf64, ceilf64, __nv_atan);
+    float_impl!(f32, expf32, logf32, sqrtf32, powf32, floorf32, ceilf32, __nv_atanf, sinf32, cosf32, __nv_asinf, __nv_acosf, __nv_atan2f);
+    float_impl!(f64, expf64, logf64, sqrtf64, powf64, floorf64, ceilf64, __nv_atan, sinf64, cosf64, __nv_asin, __nv_acos, __nv_atan2);
 }
