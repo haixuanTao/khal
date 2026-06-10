@@ -1295,6 +1295,15 @@ impl Backend for GpuBackend {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn as_cuda(&self) -> Option<&Cuda> {
+        match self {
+            GpuBackend::Cuda(backend) => Some(backend),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     async fn read_buffer<T: MaybeSendSync + DeviceValue + AnyBitPattern>(
         &self,
         buffer: &Self::Buffer<T>,

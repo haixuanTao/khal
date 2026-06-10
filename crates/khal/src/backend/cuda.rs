@@ -8,7 +8,54 @@ use cudarc::driver::{self, CudaContext, CudaStream};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+// ── Per-kernel profiling (KHAL_CUDA_PROFILE) ───────────────────────────
+//
+// When `KHAL_CUDA_PROFILE` is set, `launch()` brackets each kernel with a
+// `synchronize()` before and after, accumulating wall time keyed by kernel
+// name into this global. Serializes the stream (perturbs absolute time) but
+// gives clean per-kernel GPU time for *ranking*. Drain + print via
+// `dump_kernel_profile()`. Works on any GPU (no CUPTI / Nsight needed).
+static KERNEL_PROFILE: OnceLock<Mutex<HashMap<String, (u64, u128)>>> = OnceLock::new();
+
+fn kernel_profile() -> &'static Mutex<HashMap<String, (u64, u128)>> {
+    KERNEL_PROFILE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Print the accumulated per-kernel timing table (sorted by total time,
+/// descending) to stderr and clear it. No-op if profiling was never enabled.
+/// Call after a timed region; sees launches from every thread.
+pub fn dump_kernel_profile() {
+    let mut map = kernel_profile().lock().unwrap();
+    if map.is_empty() {
+        return;
+    }
+    let mut rows: Vec<(String, u64, u128)> =
+        map.iter().map(|(k, (c, ns))| (k.clone(), *c, *ns)).collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    let total_ns: u128 = rows.iter().map(|r| r.2).sum();
+    eprintln!(
+        "\n=== KHAL_CUDA_PROFILE: {} distinct kernels, {:.3} ms total GPU (serialized) ===",
+        rows.len(),
+        total_ns as f64 / 1e6
+    );
+    eprintln!(
+        "{:>9}  {:>7}  {:>9}  {:>11}  kernel",
+        "total_ms", "calls", "avg_us", "% of total"
+    );
+    for (name, calls, ns) in &rows {
+        eprintln!(
+            "{:>9.3}  {:>7}  {:>9.2}  {:>10.2}%  {}",
+            *ns as f64 / 1e6,
+            calls,
+            (*ns as f64 / *calls as f64) / 1e3,
+            *ns as f64 / total_ns as f64 * 100.0,
+            name
+        );
+    }
+    map.clear();
+}
 
 // ── Core backend ───────────────────────────────────────────────────────
 
@@ -26,7 +73,16 @@ impl Cuda {
     /// Creates a new CUDA backend using the specified device ordinal.
     pub fn new(device_ordinal: usize) -> Result<Self, CudaBackendError> {
         let ctx = CudaContext::new(device_ordinal)?;
-        let stream = ctx.default_stream();
+        // Disable cudarc's per-buffer read/write event tracking. khal runs all
+        // work on one ordered stream, so those hazard events are redundant —
+        // and each launch's `stream.wait(event)` inserts cross-stream edges that
+        // make `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` abort CUDA-graph capture.
+        // SAFETY: correctness relies on khal's single-stream submission ordering
+        // (kernels on one stream execute in order), which this backend upholds.
+        unsafe { ctx.disable_event_tracking() };
+        // A created stream (not the legacy default stream) is required for graph
+        // capture — the default stream reports CAPTURE_UNSUPPORTED.
+        let stream = ctx.new_stream()?;
         Ok(Self {
             ctx,
             stream,
@@ -34,12 +90,51 @@ impl Cuda {
         })
     }
 
+    /// Begin CUDA-graph stream capture on the backend stream. Subsequent kernel
+    /// launches are recorded (not executed) until [`Cuda::end_capture`]. Requires
+    /// the launch sequence to be capture-clean (no host readbacks in between).
+    pub fn begin_capture(&self) -> Result<(), CudaBackendError> {
+        self.stream
+            .begin_capture(driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+        Ok(())
+    }
+
+    /// End capture and instantiate the recorded launches into a replayable graph.
+    pub fn end_capture(&self) -> Result<CapturedGraph, CudaBackendError> {
+        // cuGraphInstantiate flags = 0 (no flags). The bindgen enum is repr(u32)
+        // with no 0 variant, so transmute the zero bit-pattern.
+        let no_flags =
+            unsafe { std::mem::transmute::<u32, driver::sys::CUgraphInstantiate_flags>(0u32) };
+        let graph = self
+            .stream
+            .end_capture(no_flags)?
+            .ok_or(CudaBackendError::CaptureProducedNoGraph)?;
+        Ok(CapturedGraph { graph })
+    }
+}
+
+/// An instantiated CUDA graph that replays a captured launch sequence with a
+/// single `cuGraphLaunch`, skipping all per-dispatch host encode. Replay runs on
+/// the backend's stream; pair with `backend.synchronize()` to wait.
+pub struct CapturedGraph {
+    graph: driver::CudaGraph,
+}
+
+impl CapturedGraph {
+    /// Replay the captured launch sequence on the backend stream.
+    pub fn launch(&self) -> Result<(), CudaBackendError> {
+        self.graph.launch()?;
+        Ok(())
+    }
+}
+
+impl Cuda {
     /// Returns the underlying cudarc context.
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.ctx
     }
 
-    /// Returns the default stream.
+    /// Returns the backend stream.
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
     }
@@ -55,6 +150,8 @@ pub enum CudaBackendError {
     Driver(#[from] driver::DriverError),
     #[error("Invalid PTX module")]
     InvalidPtx,
+    #[error("CUDA graph capture produced no graph")]
+    CaptureProducedNoGraph,
 }
 
 // ── Buffer ─────────────────────────────────────────────────────────────
@@ -316,10 +413,7 @@ impl Backend for Cuda {
     ) -> Result<Self::Function, Self::Error> {
         let func = match module.inner.load_function(entry_point) {
             Ok(f) => f,
-            Err(e) => {
-                eprintln!("[khal-cuda load_function FAIL] {} -> {:?}", entry_point, e);
-                return Err(e.into());
-            }
+            Err(e) => { eprintln!("[khal-cuda load_function FAIL] {} -> {:?}", entry_point, e); return Err(e.into()); }
         };
         Ok(CudaFunction { func, name: entry_point.to_string() })
     }
@@ -615,9 +709,55 @@ impl<'a> Dispatch<'a, Cuda> for CudaDispatch<'a> {
                 "[khal-cuda launch] {} nargs={} grid={:?} block={:?}",
                 self.function.name, param_values.len(), grid_dim, block_dim
             );
+            if std::env::var_os("KHAL_CUDA_ARGS").is_some() {
+                let peek = std::env::var_os("KHAL_CUDA_PEEK").is_some();
+                if peek {
+                    let _ = self.stream.synchronize();
+                }
+                for (binding, ptr, byte_len) in &self.args {
+                    let mut content = String::new();
+                    if peek && *byte_len >= 4 {
+                        let n = ((*byte_len / 4).min(6)) as usize;
+                        let mut host = vec![0u32; n];
+                        let ok = unsafe {
+                            driver::result::memcpy_dtoh_sync(
+                                &mut host,
+                                *ptr as driver::sys::CUdeviceptr,
+                            )
+                        };
+                        if ok.is_ok() {
+                            content = format!(" content={host:?}");
+                        }
+                    }
+                    eprintln!(
+                        "    arg space={} idx={} ptr={:#x} byte_len={} ({} u32){}",
+                        binding.space,
+                        binding.index,
+                        ptr,
+                        byte_len,
+                        byte_len / 4,
+                        content
+                    );
+                }
+            }
         }
+        // Per-kernel profiling: drain prior work, time only this launch.
+        let prof_start = if std::env::var_os("KHAL_CUDA_PROFILE").is_some() {
+            self.stream.synchronize()?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         unsafe {
             builder.launch(cfg)?;
+        }
+        if let Some(t0) = prof_start {
+            self.stream.synchronize()?;
+            let ns = t0.elapsed().as_nanos();
+            let mut map = kernel_profile().lock().unwrap();
+            let e = map.entry(self.function.name.clone()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += ns;
         }
         if trace {
             match self.stream.synchronize() {

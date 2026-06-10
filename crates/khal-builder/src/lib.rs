@@ -165,33 +165,42 @@ impl KhalBuilder {
     /// Compiles the shader crate to PTX for the CUDA backend.
     #[cfg(feature = "cuda")]
     fn build_ptx(&self, output_dir: impl AsRef<Path>) {
+        // PATCHED (cuda-oxide bridge): bypass cargo-cuda / rustc_codegen_nvvm
+        // (LLVM-7 wall). Inject a cuda-oxide-produced PTX via
+        // CUDA_OXIDE_SHADERS_PTX, else write a minimal stub so include_dir!
+        // succeeds during the host build.
         let output_dir = output_dir.as_ref();
-        let features_str = self.features.join(",");
-
-        let mut args = vec![
-            "cuda",
-            "build",
-            "--shader-crate",
-            self.shader_crate
-                .to_str()
-                .expect("Invalid shader crate path"),
-            "--output-dir",
-            output_dir.to_str().expect("Invalid output directory path"),
-        ];
-
-        if !features_str.is_empty() {
-            args.push("--features");
-            args.push(&features_str);
+        std::fs::create_dir_all(output_dir).ok();
+        let dest = output_dir.join("shaders.ptx");
+        // Per-crate override: CUDA_OXIDE_SHADERS_PTX_<SHADER_CRATE_DIR_NAME>
+        // (uppercased, '-'->'_'). Lets a single host build that pulls BOTH
+        // nexus_rbd_shaders3d and vortx-shaders embed each crate's own cubin
+        // (the generic var alone would inject one cubin into both). Falls back
+        // to the generic CUDA_OXIDE_SHADERS_PTX.
+        let crate_key = self
+            .shader_crate
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| {
+                format!(
+                    "CUDA_OXIDE_SHADERS_PTX_{}",
+                    s.to_ascii_uppercase().replace('-', "_")
+                )
+            });
+        let src = crate_key
+            .as_ref()
+            .and_then(|k| std::env::var(k).ok())
+            .or_else(|| std::env::var("CUDA_OXIDE_SHADERS_PTX").ok());
+        if let Some(srcptx) = src {
+            std::fs::copy(&srcptx, &dest).expect("copy cuda-oxide PTX");
+            println!("cargo:warning=build_ptx: injected cuda-oxide PTX from {srcptx}");
+        } else {
+            std::fs::write(&dest, ".version 8.0\n.target sm_120\n.address_size 64\n").unwrap();
+            println!("cargo:warning=build_ptx: wrote stub shaders.ptx");
         }
-
-        let status = Command::new("cargo")
-            .args(args)
-            .env("RUST_MIN_STACK", self.rust_min_stack.to_string())
-            .status()
-            .expect("failed to run cargo cuda");
-
-        if !status.success() {
-            panic!("cargo cuda build failed");
+        if let Some(k) = &crate_key {
+            println!("cargo:rerun-if-env-changed={k}");
         }
+        println!("cargo:rerun-if-env-changed=CUDA_OXIDE_SHADERS_PTX");
     }
 }
