@@ -63,6 +63,14 @@ impl GpuBackend {
         matches!(self, Self::Cuda(..))
     }
 
+    /// Without the `cuda` feature there is no CUDA backend, so this is always
+    /// `false` — lets callers (e.g. nexus's fixed-grid default) query the
+    /// backend unconditionally.
+    #[cfg(not(feature = "cuda"))]
+    pub fn is_cuda(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this is the Metal backend.
     #[cfg(feature = "metal")]
     pub fn is_metal(&self) -> bool {

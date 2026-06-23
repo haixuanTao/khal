@@ -121,6 +121,14 @@ pub struct CapturedGraph {
 }
 
 impl CapturedGraph {
+    /// Upload the instantiated graph to the stream ahead of the first launch, so
+    /// the initial `cuGraphLaunch` doesn't pay the one-time node setup / device
+    /// allocation cost inline. Optional — `launch()` works without it.
+    pub fn upload(&self) -> Result<(), CudaBackendError> {
+        self.graph.upload()?;
+        Ok(())
+    }
+
     /// Replay the captured launch sequence on the backend stream.
     pub fn launch(&self) -> Result<(), CudaBackendError> {
         self.graph.launch()?;
