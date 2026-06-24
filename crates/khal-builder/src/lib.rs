@@ -93,6 +93,40 @@ impl KhalBuilder {
 
         self.setup_change_detection();
 
+        // cuda-oxide path: when a prebuilt cubin is supplied out-of-band (the
+        // shader crate was compiled to a cubin via the cuda-oxide PTX backend),
+        // embed it directly as `shaders.ptx` and skip the cargo-gpu / cargo-cuda
+        // shader builds — those need their own toolchains, which the cuda-oxide
+        // flow deliberately bypasses. The host's `include_dir!("$OUT_DIR/
+        // shaders-spirv")` then picks the cubin up unchanged.
+        //
+        // The cubin is selected per shader crate via
+        // `CUDA_OXIDE_SHADERS_PTX_<CRATE>` (crate dir name upper-cased, `-`→`_`,
+        // e.g. `vortx-shaders` → `CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS`), so a
+        // multi-cubin build (nexus rbd + vortx) embeds the right one in each.
+        // A generic `CUDA_OXIDE_SHADERS_PTX` is the single-crate fallback.
+        let crate_env = self
+            .shader_crate
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("CUDA_OXIDE_SHADERS_PTX_{}", n.to_uppercase().replace('-', "_")));
+        if let Some(ref k) = crate_env {
+            println!("cargo:rerun-if-env-changed={k}");
+        }
+        println!("cargo:rerun-if-env-changed=CUDA_OXIDE_SHADERS_PTX");
+        let cubin = crate_env
+            .as_deref()
+            .and_then(std::env::var_os)
+            .or_else(|| std::env::var_os("CUDA_OXIDE_SHADERS_PTX"));
+        if let Some(cubin) = cubin {
+            std::fs::create_dir_all(output_dir)
+                .expect("failed to create shader output dir for the cuda-oxide cubin");
+            std::fs::copy(&cubin, output_dir.join("shaders.ptx")).unwrap_or_else(|e| {
+                panic!("failed to copy cuda-oxide cubin ({cubin:?}) into {output_dir:?}: {e}")
+            });
+            return;
+        }
+
         if self.build_spirv {
             self.build_spirv(output_dir);
         }

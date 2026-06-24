@@ -38,20 +38,27 @@ rust-cuda = ["dep:cuda_std"]
 # `cuda-device` dependency, but that crate lives in the cuda-oxide tree and is
 # only present on the build box; it is added there. This manifest keeps the
 # feature host-buildable everywhere else.
-cuda-oxide = ["dep:num-traits"]
+cuda-oxide = ["dep:num-traits", "dep:cuda-device"]
 
 [dependencies]
 glamx = { version = "0.2", default-features = false, features = ["nostd-libm", "bytemuck"] }
 rayon = { version = "1", optional = true }
 corosensei = { version = "0.3", optional = true }
 spirv-std-macros = "0.10.0-alpha.1"
-khal-derive = { version = "0.1.0", path = "../khal-derive" }
+khal-derive = { version = "0.2.0", path = "../khal-derive" }
 
 [lints]
 workspace = true
 
 [target.'cfg(not(target_arch = "nvptx64"))'.dependencies]
 spirv-std = "0.10.0-alpha.1"
+# Cap glam < 0.33 for the shader build: spirv-std 0.10.0-alpha.1 declares glam
+# ">=0.30.8" (open-ended), but glam 0.33 dropped `UVec4`/`UVec3` under
+# default-features=false, which breaks spirv-std's compile (112 errors). The
+# `cargo gpu build` sub-invocation re-resolves without the workspace lock and
+# would otherwise pick the newest 0.33.x. 0.32.1 is the newest pre-0.33 version
+# that still works. (Mirrors the same pin in vortx-shaders.)
+glam = { version = "=0.32.1", default-features = false, features = ["libm", "scalar-math"] }
 
 [target.'cfg(target_arch = "nvptx64")'.dependencies]
 # Fixes the UVec3::element_product bug. Optional: only the `rust-cuda` backend
@@ -61,4 +68,4 @@ cuda_std = { git = "https://github.com/sebcrozet/Rust-CUDA.git", branch = "glam-
 # `Float` for the cuda-oxide backend (libm software math, no_std).
 num-traits = { version = "0.2", default-features = false, features = ["libm"], optional = true }
 # (cuda-oxide device build only, added on the build box:)
-# cuda-device = { path = ".../cuda-oxide/crates/cuda-device", optional = true }
+cuda-device = { path = "/root/cuda-oxide-src/crates/cuda-device", optional = true }
