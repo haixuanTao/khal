@@ -870,6 +870,27 @@ impl Backend for GpuBackend {
     type Function = InnerGpuFunction;
     type Dispatch<'a> = GpuDispatch<'a>;
 
+    /// Downcast the runtime-selected backend to the concrete CUDA backend (so
+    /// callers can reach CUDA-only features like graph capture). Returns `None`
+    /// for any non-CUDA variant.
+    #[cfg(feature = "cuda")]
+    fn as_cuda(&self) -> Option<&super::Cuda> {
+        match self {
+            Self::Cuda(backend) => Some(backend),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "webgpu")]
+    fn as_webgpu(&self) -> Option<&super::WebGpu> {
+        match self {
+            Self::WebGpu(backend) => Some(backend),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     /*
      * Module/function loading.
      */
