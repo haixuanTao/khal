@@ -39,6 +39,12 @@ impl Cuda {
         &self.ctx
     }
 
+    /// Compute capability `(major, minor)` of the underlying device, e.g.
+    /// `(12, 0)` for Blackwell `sm_120`. Used to pick the default backend.
+    pub fn compute_capability(&self) -> Result<(i32, i32), CudaBackendError> {
+        Ok(self.ctx.compute_capability()?)
+    }
+
     /// Returns the default stream.
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
